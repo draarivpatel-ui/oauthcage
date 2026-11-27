@@ -280,6 +280,95 @@ test('CLI output contains no raw ANSI or control characters from hostile input',
   assert.equal((result.stdout + result.stderr).includes('\x1b'), false);
 });
 
+test('CLI help lists audit-endpoint', () => {
+  const result = runCli(['--help']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /audit-endpoint <url\|->/u);
+});
+
+test('CLI audit-endpoint exits zero for a public HTTPS endpoint on port 443', () => {
+  for (const url of ['https://issuer.example/jwks', 'https://issuer.example:443/token']) {
+    const result = runCli(['audit-endpoint', url, '--json']);
+    assert.equal(result.status, 0, url + ' ' + result.stderr + result.stdout);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.kind, 'endpoint-url');
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.port, '443');
+  }
+});
+
+test('CLI audit-endpoint reads bounded stdin and honors --policy', () => {
+  const result = runCli(['audit-endpoint', '-', '--policy', 'confidential', '--json'], 'https://issuer.example/par');
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.equal(JSON.parse(result.stdout).policy, 'confidential');
+});
+
+test('CLI audit-endpoint does not trim whitespace from stdin', () => {
+  const result = runCli(['audit-endpoint', '-'], 'https://issuer.example/jwks\n');
+  assert.equal(result.status, 1);
+});
+
+const DENIED_ENDPOINTS = [
+  ['plain HTTP', 'http://issuer.example/token', 'OAUTHCAGE_ENDPOINT_SCHEME_DENIED'],
+  ['userinfo', 'https://user:pass@issuer.example/token', 'OAUTHCAGE_ENDPOINT_USERINFO'],
+  ['fragment', 'https://issuer.example/token#frag', 'OAUTHCAGE_ENDPOINT_FRAGMENT'],
+  ['query string', 'https://issuer.example/token?tenant=a', 'OAUTHCAGE_ENDPOINT_QUERY_DENIED'],
+  ['private IPv4', 'https://10.0.0.1/token', 'OAUTHCAGE_ENDPOINT_IP_NOT_PUBLIC'],
+  ['loopback IPv4', 'https://127.0.0.1/token', 'OAUTHCAGE_ENDPOINT_IP_NOT_PUBLIC'],
+  ['loopback IPv6', 'https://[::1]/token', 'OAUTHCAGE_ENDPOINT_IP_NOT_PUBLIC'],
+  ['cloud metadata IPv4', 'https://169.254.169.254/latest', 'OAUTHCAGE_ENDPOINT_METADATA_DENIED'],
+  ['cloud metadata IPv6', 'https://[fd00:ec2::23]/latest', 'OAUTHCAGE_ENDPOINT_METADATA_DENIED'],
+  ['decimal integer IPv4', 'https://2130706433/token', 'OAUTHCAGE_ENDPOINT_IP_OBFUSCATED'],
+  ['hexadecimal shorthand IPv4', 'https://0x7f.1/token', 'OAUTHCAGE_ENDPOINT_IP_OBFUSCATED'],
+  ['IPv4-mapped IPv6', 'https://[::ffff:127.0.0.1]/token', 'OAUTHCAGE_ENDPOINT_TUNNEL_DENIED'],
+  ['NAT64 metadata', 'https://[64:ff9b::a9fe:a9fe]/token', 'OAUTHCAGE_ENDPOINT_TUNNEL_DENIED'],
+  ['6to4 metadata', 'https://[2002:a9fe:a9fe::]/token', 'OAUTHCAGE_ENDPOINT_TUNNEL_DENIED'],
+  ['non-default port', 'https://issuer.example:8443/token', 'OAUTHCAGE_ENDPOINT_PORT_DENIED']
+];
+
+for (const [label, url, code] of DENIED_ENDPOINTS) {
+  test('CLI audit-endpoint exits one for ' + label, () => {
+    const text = runCli(['audit-endpoint', url]);
+    assert.equal(text.status, 1, text.stderr + text.stdout);
+    assert.match(text.stdout, /^audit-endpoint: fail$/mu);
+    assert.equal(text.stdout.includes(code), true, text.stdout);
+    const json = runCli(['audit-endpoint', url, '--json']);
+    assert.equal(json.status, 1);
+    const parsed = JSON.parse(json.stdout);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.canonical, null);
+    assert.equal(parsed.findings.some((finding) => finding.code === code), true, json.stdout);
+  });
+}
+
+test('CLI audit-endpoint does not echo a rejected path or query value', () => {
+  const url = 'https://10.0.0.1/hidden-path-marker?tenant=hidden-query-marker#hidden-fragment-marker';
+  for (const args of [['audit-endpoint', url], ['audit-endpoint', url, '--json']]) {
+    const result = runCli(args);
+    assert.equal(result.status, 1);
+    const output = result.stdout + result.stderr;
+    for (const marker of ['hidden-path-marker', 'hidden-query-marker', 'hidden-fragment-marker']) {
+      assert.equal(output.includes(marker), false, marker);
+    }
+  }
+});
+
+test('CLI audit-endpoint neutralizes hostile terminal characters', () => {
+  const hostile = 'https://issuer.example/\x1b[31m\u202e\u2066\u2028\u2029\u0085\x07token';
+  for (const args of [['audit-endpoint', hostile], ['audit-endpoint', hostile, '--json'], ['audit-endpoint', '-']]) {
+    const result = runCli(args, args[1] === '-' ? hostile : undefined);
+    assert.equal(result.status, 1, result.stderr + result.stdout);
+    assert.equal(/[\u0000-\u0009\u000B-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\u2028\u2029]/u.test(result.stdout + result.stderr), false);
+  }
+});
+
+test('CLI audit-endpoint usage errors exit two', () => {
+  assert.equal(runCli(['audit-endpoint', 'https://issuer.example/a', 'https://issuer.example/b']).status, 2);
+  assert.equal(runCli(['audit-endpoint', 'https://issuer.example/jwks', '--registered', 'https://issuer.example/cb']).status, 2);
+  assert.equal(runCli(['audit-endpoint', 'https://issuer.example/jwks', '--policy']).status, 2);
+  assert.equal(runCli(['audit-endpoint', 'https://issuer.example/jwks', '--policy', 'missing-preset']).status, 2);
+});
+
 function listFiles(directory) {
   const output = [];
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
