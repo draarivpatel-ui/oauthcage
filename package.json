@@ -1,0 +1,75 @@
+{
+  "name": "oauthcage",
+  "version": "1.0.0",
+  "description": "Zero-dependency OAuth 2.0 and OpenID Connect security firewall for redirect URIs, PKCE, callbacks, token requests, discovery metadata, and SSRF-sensitive endpoints",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/draarivpatel-ui/oauthcage.git"
+  },
+  "homepage": "https://github.com/draarivpatel-ui/oauthcage#readme",
+  "bugs": {
+    "url": "https://github.com/draarivpatel-ui/oauthcage/issues"
+  },
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./src/index.mjs",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./src/index.mjs",
+      "require": "./cjs/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "oauthcage": "bin/oauthcage.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "cjs",
+    "types",
+    "examples",
+    "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:cjs": "node scripts/build-cjs.mjs",
+    "check:cjs": "node scripts/build-cjs.mjs --check",
+    "check:types": "node scripts/check-types.mjs",
+    "smoke": "node scripts/cli-smoke.mjs",
+    "test": "node scripts/run-tests.mjs",
+    "prepack": "node scripts/build-cjs.mjs --check"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "security",
+    "oauth",
+    "oauth2",
+    "oidc",
+    "openid-connect",
+    "pkce",
+    "rfc7636",
+    "rfc8252",
+    "rfc9207",
+    "rfc9700",
+    "redirect-uri",
+    "open-redirect",
+    "mix-up-attack",
+    "ssrf",
+    "discovery",
+    "zero-dependency",
+    "nodejs"
+  ],
+  "author": "draarivpatel-ui",
+  "license": "MIT",
+  "sideEffects": false,
+  "dependencies": {},
+  "devDependencies": {}
+}
