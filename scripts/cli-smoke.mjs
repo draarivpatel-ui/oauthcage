@@ -65,6 +65,21 @@ assert(cleanOutput(result), 'discovery output is terminal safe');
 result = run(['audit-discovery', '-', '--expected-issuer', 'https://issuer.example'], '   ');
 assert(result.status !== 0, 'whitespace only stdin is not trimmed into a pass');
 
+result = run(['audit-endpoint', 'https://issuer.example/jwks', '--json']);
+assert(result.status === 0, 'public HTTPS endpoint audit passes');
+assert(cleanOutput(result), 'endpoint output is terminal safe');
+
+result = run(['audit-endpoint', '-', '--json'], 'https://169.254.169.254/smoke-endpoint-path?smoke-endpoint-query=1');
+assert(result.status === 1, 'cloud metadata endpoint fails from stdin');
+assert(!result.stdout.includes('smoke-endpoint-path') && !result.stdout.includes('smoke-endpoint-query'), 'endpoint failure does not echo the path or query');
+
+result = run(['audit-endpoint', 'https://issuer.example/\u001b[31m\u202e\u2028token']);
+assert(result.status === 1, 'hostile endpoint fails');
+assert(cleanOutput(result) && !/[\u202E\u2028]/u.test(result.stdout + result.stderr), 'hostile endpoint output is terminal safe');
+
+result = run(['audit-endpoint', 'https://issuer.example/a', 'https://issuer.example/b']);
+assert(result.status === 2, 'audit-endpoint usage error exits two');
+
 result = run(['not-a-command']);
 assert(result.status === 2, 'unknown command exits two');
 
