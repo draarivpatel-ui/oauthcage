@@ -26,6 +26,8 @@ const INTEGER_KEYS = Object.freeze({
   maxDiscoveryBytes: [1024, 1048576],
   maxDiscoveryDepth: [2, 64],
   maxDiscoveryKeys: [16, 4096],
+  maxJsonIntDigits: [128, 10000],
+  maxFindings: [0, 1000],
   minStateLength: [22, 512],
   minNonceLength: [22, 512],
   minAuthorizationCodeLength: [8, 256],
@@ -70,6 +72,8 @@ const BASE_POLICY = {
   maxDiscoveryBytes: 131072,
   maxDiscoveryDepth: 10,
   maxDiscoveryKeys: 256,
+  maxJsonIntDigits: 4300,
+  maxFindings: 150,
   requireS256InDiscovery: true,
   requireAsymmetricIdTokenAlgorithms: true
 };

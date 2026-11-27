@@ -9,8 +9,9 @@ Initial release.
 - High entropy state and nonce generation and verification
 - Authorization request, callback, and token request firewalls
 - RFC 9207 issuer validation and duplicate parameter detection
-- OIDC discovery metadata validation
-- HTTPS endpoint SSRF and cloud metadata defenses
+- OIDC discovery metadata validation with duplicate-key, numeric, UTF-8 byte, depth, and key-count limits
+- HTTPS endpoint SSRF and cloud metadata defenses including ISATAP transition decoding
+- Fail-closed bounded audit findings and encoded secret redaction
 - Frozen strict, spa, confidential, and native policy presets
 - Dual ESM and CommonJS builds with TypeScript declarations
 - Security-focused command line interface

@@ -177,6 +177,20 @@ for (const key of ['access_token', 'id_token', 'refresh_token', 'client_secret',
   });
 }
 
+for (const encodedKey of ['%63ode', '%61ccess_token', '%69d_token']) {
+  test('redaction hides percent-encoded sensitive key ' + encodedKey, () => {
+    const output = esm.redactSensitiveText('https://x/cb?' + encodedKey + '=secret-value&x=1');
+    assert.equal(output.includes('secret-value'), false);
+    assert.equal(output.includes('[REDACTED]'), true);
+  });
+}
+
+test('redaction hides colon-assigned sensitive JSON values', () => {
+  const output = esm.redactSensitiveText('{"access_token":"secret-value","x":1}');
+  assert.equal(output.includes('secret-value'), false);
+  assert.equal(output.includes('[REDACTED]'), true);
+});
+
 function runCli(args, input) {
   return spawnSync(process.execPath, [cli, ...args], {
     cwd: root,

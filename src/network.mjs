@@ -173,6 +173,10 @@ export function ipv6Analysis(groups) {
     const embedded = [(groups[6] >> 8) ^ 255, (groups[6] & 255) ^ 255, (groups[7] >> 8) ^ 255, (groups[7] & 255) ^ 255];
     return { scope: 'tunnel', tunnel: 'teredo', embeddedIpv4: embedded, embeddedScope: ipv4Scope(embedded) };
   }
+  if ((groups[4] === 0x0000 || groups[4] === 0x0200) && groups[5] === 0x5efe) {
+    const embedded = ipv4FromGroups(groups);
+    return { scope: 'tunnel', tunnel: 'isatap', embeddedIpv4: embedded, embeddedScope: ipv4Scope(embedded) };
+  }
   if (groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff) {
     const embedded = ipv4FromGroups(groups);
     return { scope: 'tunnel', tunnel: 'ipv4-mapped', embeddedIpv4: embedded, embeddedScope: ipv4Scope(embedded) };

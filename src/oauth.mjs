@@ -281,14 +281,14 @@ export function auditAuthRequest(input, options = {}) {
   if (responseMode === 'fragment') {
     findings.push(makeFinding(CODE.RESPONSE_MODE_DENIED, 'fragment response mode is denied', 'response_mode', OAUTHCAGE_SEVERITY.CRITICAL));
   }
-  scanSensitiveKeys(values, 'authorization request', findings, false);
+  scanSensitiveKeys(values, 'authorization request', findings, true);
 
   return finishAudit('authorization-request', policy.name, findings, {
     flow: responseType === 'code' ? 'authorization_code' : null,
     usesPar: requestUri !== undefined,
     hasPkce: challenge !== undefined,
     hasState: state !== undefined
-  });
+  }, policy.maxFindings);
 }
 
 export function auditCallback(input, options = {}) {
@@ -366,7 +366,7 @@ export function auditCallback(input, options = {}) {
     hasCode: code !== undefined,
     hasIssuer: issuer !== undefined,
     hasState: state !== undefined
-  });
+  }, policy.maxFindings);
 }
 
 export function auditTokenRequest(input, options = {}) {
@@ -432,5 +432,5 @@ export function auditTokenRequest(input, options = {}) {
     grantType: grantType === undefined ? null : grantType,
     usesPkce: firstValue(values, 'code_verifier') !== undefined,
     usesClientSecret: hasParameter(values, 'client_secret')
-  });
+  }, policy.maxFindings);
 }

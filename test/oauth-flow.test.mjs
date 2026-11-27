@@ -215,7 +215,7 @@ for (const [label, requestUri] of [
   });
 }
 
-for (const name of ['access_token', 'id_token', 'refresh_token', 'client_secret', 'code_verifier', 'password']) {
+for (const name of ['access_token', 'id_token', 'refresh_token', 'client_secret', 'code_verifier', 'password', 'code']) {
   test('authorization request rejects embedded secret parameter ' + name, () => {
     expectAuthFail(validAuthQuery({ [name]: 'secret-value' }), 'OAUTHCAGE_SECRET_LEAK');
   });

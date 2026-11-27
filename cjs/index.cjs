@@ -21,6 +21,7 @@ const OAUTHCAGE_ERROR_CODES = Object.freeze({
   PARAMETER_TOO_LONG: 'OAUTHCAGE_PARAMETER_TOO_LONG',
   DUPLICATE_PARAMETER: 'OAUTHCAGE_DUPLICATE_PARAMETER',
   PROTOTYPE_POLLUTION: 'OAUTHCAGE_PROTOTYPE_POLLUTION',
+  FINDINGS_TRUNCATED: 'OAUTHCAGE_FINDINGS_TRUNCATED',
 
   POLICY_INVALID: 'OAUTHCAGE_POLICY_INVALID',
   POLICY_UNKNOWN: 'OAUTHCAGE_POLICY_UNKNOWN',
@@ -104,6 +105,7 @@ const OAUTHCAGE_ERROR_CODES = Object.freeze({
 
   DISCOVERY_INVALID_JSON: 'OAUTHCAGE_DISCOVERY_INVALID_JSON',
   DISCOVERY_INVALID_DOCUMENT: 'OAUTHCAGE_DISCOVERY_INVALID_DOCUMENT',
+  DISCOVERY_DUPLICATE_KEY: 'OAUTHCAGE_DISCOVERY_DUPLICATE_KEY',
   DISCOVERY_ISSUER_REQUIRED: 'OAUTHCAGE_DISCOVERY_ISSUER_REQUIRED',
   DISCOVERY_ISSUER_MISMATCH: 'OAUTHCAGE_DISCOVERY_ISSUER_MISMATCH',
   DISCOVERY_ENDPOINT_REQUIRED: 'OAUTHCAGE_DISCOVERY_ENDPOINT_REQUIRED',
@@ -334,6 +336,10 @@ function ipv6Analysis(groups) {
     const embedded = [(groups[6] >> 8) ^ 255, (groups[6] & 255) ^ 255, (groups[7] >> 8) ^ 255, (groups[7] & 255) ^ 255];
     return { scope: 'tunnel', tunnel: 'teredo', embeddedIpv4: embedded, embeddedScope: ipv4Scope(embedded) };
   }
+  if ((groups[4] === 0x0000 || groups[4] === 0x0200) && groups[5] === 0x5efe) {
+    const embedded = ipv4FromGroups(groups);
+    return { scope: 'tunnel', tunnel: 'isatap', embeddedIpv4: embedded, embeddedScope: ipv4Scope(embedded) };
+  }
   if (groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff) {
     const embedded = ipv4FromGroups(groups);
     return { scope: 'tunnel', tunnel: 'ipv4-mapped', embeddedIpv4: embedded, embeddedScope: ipv4Scope(embedded) };
@@ -395,6 +401,13 @@ const SENSITIVE_PARAMETER_NAMES = Object.freeze([
   'assertion',
   'token'
 ]);
+const OBJECT_INJECTION_KEYS = Object.freeze([
+  '__proto__',
+  'constructor',
+  'prototype',
+  'toString',
+  'valueOf'
+]);
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -417,12 +430,24 @@ function hasErrorFinding(findings) {
   return findings.some((finding) => finding.severity === OAUTHCAGE_SEVERITY.ERROR || finding.severity === OAUTHCAGE_SEVERITY.CRITICAL);
 }
 
-function finishAudit(kind, policyName, findings, extra) {
+function finishAudit(kind, policyName, findings, extra, maxFindings = 150) {
+  const totalFindings = findings.length;
+  const truncated = totalFindings > maxFindings;
+  const bounded = findings.slice(0, maxFindings);
+  if (truncated && maxFindings > 0) {
+    bounded[maxFindings - 1] = makeFinding(
+      CODE.FINDINGS_TRUNCATED,
+      'finding output was capped and the audit is failed closed',
+      'findings'
+    );
+  }
   return deepFreeze({
     kind,
     policy: policyName,
-    ok: !hasErrorFinding(findings),
-    findings: findings.slice(),
+    ok: !hasErrorFinding(findings) && !truncated,
+    findings: bounded,
+    truncated,
+    totalFindings,
     ...(extra || {})
   });
 }
@@ -591,17 +616,32 @@ function predictableToken(value) {
   return repeatedChunkPattern(value);
 }
 
-function scanPrototypeKeys(value, depth = 0, state = { count: 0, maxDepth: 0, seen: new Set() }) {
+function scanPrototypeKeys(value) {
   if (value === null || typeof value !== 'object') return null;
-  if (state.seen.has(value)) return null;
-  state.seen.add(value);
-  state.count += 1;
-  state.maxDepth = Math.max(state.maxDepth, depth);
-  const keys = Array.isArray(value) ? value.map((_, index) => String(index)) : Object.keys(value);
-  for (const key of keys) {
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return key;
-    const nested = scanPrototypeKeys(value[key], depth + 1, state);
-    if (nested !== null) return nested;
+  const seen = new Set();
+  const stack = [value];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current === null || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    let keys;
+    try {
+      keys = Object.keys(current);
+    } catch {
+      return '__object_keys_unavailable__';
+    }
+    for (const key of keys) {
+      if (OBJECT_INJECTION_KEYS.includes(key)) return key;
+      let descriptor;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(current, key);
+      } catch {
+        return key;
+      }
+      if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return key;
+      const nested = descriptor.value;
+      if (nested !== null && typeof nested === 'object' && !seen.has(nested)) stack.push(nested);
+    }
   }
   return null;
 }
@@ -635,9 +675,65 @@ function neutralizeTerminal(text) {
   return output;
 }
 
+function decodedSensitiveParameterName(rawName) {
+  if (rawName.length === 0 || rawName.length > 128) return null;
+  let decoded;
+  try {
+    decoded = percentDecode(rawName, { plusAsSpace: true }).toLowerCase();
+  } catch {
+    return null;
+  }
+  return SENSITIVE_PARAMETER_NAMES.includes(decoded) || decoded === 'code' ? decoded : null;
+}
+
 function redactSensitiveText(text) {
-  let output = String(text);
-  output = output.replace(/([?&#]?(?:access_token|id_token|refresh_token|client_secret|code_verifier|password|assertion|token|code)=)[^&\s#]*/giu, '$1[REDACTED]');
+  const input = String(text);
+  let output = '';
+  let copied = 0;
+  let index = 0;
+  while (index < input.length) {
+    const separator = input[index];
+    if (separator !== '=' && separator !== ':') {
+      index += 1;
+      continue;
+    }
+    let keyEnd = index;
+    while (keyEnd > 0 && input[keyEnd - 1] === ' ') keyEnd -= 1;
+    if (keyEnd > 0 && (input[keyEnd - 1] === '"' || input[keyEnd - 1] === "'")) keyEnd -= 1;
+    let keyStart = keyEnd;
+    while (keyStart > 0 && !/[\s&?#;,"'=:]/u.test(input[keyStart - 1])) keyStart -= 1;
+    const rawName = input.slice(keyStart, keyEnd);
+    if (decodedSensitiveParameterName(rawName) === null) {
+      index += 1;
+      continue;
+    }
+    let valueStart = index + 1;
+    while (valueStart < input.length && input[valueStart] === ' ') valueStart += 1;
+    let valueEnd = valueStart;
+    let quoted = false;
+    if (input[valueStart] === '"' || input[valueStart] === "'") {
+      quoted = true;
+      const quote = input[valueStart];
+      valueEnd = valueStart + 1;
+      while (valueEnd < input.length) {
+        if (input[valueEnd] === '\\') {
+          valueEnd += 2;
+          continue;
+        }
+        if (input[valueEnd] === quote) break;
+        valueEnd += 1;
+      }
+      if (valueEnd < input.length) valueEnd += 1;
+    } else {
+      while (valueEnd < input.length && !/[\s&,#;]/u.test(input[valueEnd])) valueEnd += 1;
+    }
+    output += input.slice(copied, keyStart);
+    output += input.slice(keyStart, valueStart);
+    output += quoted ? input[valueStart] + '[REDACTED]' + input[valueEnd - 1] : '[REDACTED]';
+    copied = valueEnd;
+    index = valueEnd;
+  }
+  output += input.slice(copied);
   return neutralizeTerminal(output);
 }
 
@@ -649,6 +745,7 @@ __exports["CONTROL_CHARACTER_PATTERN"] = CONTROL_CHARACTER_PATTERN;
 __exports["BIDI_OR_INVISIBLE_PATTERN"] = BIDI_OR_INVISIBLE_PATTERN;
 __exports["WHITESPACE_PATTERN"] = WHITESPACE_PATTERN;
 __exports["SENSITIVE_PARAMETER_NAMES"] = SENSITIVE_PARAMETER_NAMES;
+__exports["OBJECT_INJECTION_KEYS"] = OBJECT_INJECTION_KEYS;
 __exports["isPlainObject"] = isPlainObject;
 __exports["deepFreeze"] = deepFreeze;
 __exports["makeFinding"] = makeFinding;
@@ -703,6 +800,8 @@ const INTEGER_KEYS = Object.freeze({
   maxDiscoveryBytes: [1024, 1048576],
   maxDiscoveryDepth: [2, 64],
   maxDiscoveryKeys: [16, 4096],
+  maxJsonIntDigits: [128, 10000],
+  maxFindings: [0, 1000],
   minStateLength: [22, 512],
   minNonceLength: [22, 512],
   minAuthorizationCodeLength: [8, 256],
@@ -747,6 +846,8 @@ const BASE_POLICY = {
   maxDiscoveryBytes: 131072,
   maxDiscoveryDepth: 10,
   maxDiscoveryKeys: 256,
+  maxJsonIntDigits: 4300,
+  maxFindings: 150,
   requireS256InDiscovery: true,
   requireAsymmetricIdTokenAlgorithms: true
 };
@@ -1304,7 +1405,7 @@ function auditRedirectUri(candidate, registeredRedirectUris, options = {}) {
     matched,
     matchedUri: safeCandidate && matched ? analyzedCandidate.canonical : null,
     meta: analyzedCandidate.meta
-  });
+  }, policy.maxFindings);
 }
 
 function validateRedirectUri(candidate, registeredRedirectUris, options = {}) {
@@ -1526,27 +1627,202 @@ function auditEndpointUrl(endpoint, options = {}) {
     ipScope: hostResult.ipScope,
     tunnel: hostResult.tunnel,
     port: parts && parts.port !== null ? String(Number(parts.port)) : '443'
-  });
+  }, policy.maxFindings);
 }
 
 function documentStats(value) {
-  const state = { keys: 0, maxDepth: 0, cyclic: false };
-  const active = new Set();
-  const visit = (item, depth) => {
-    if (item === null || typeof item !== 'object') return;
-    if (active.has(item)) {
+  const state = { keys: 0, maxDepth: 0, cyclic: false, invalidJsonValue: false };
+  const seen = new Set();
+  const stack = [{ item: value, depth: 0 }];
+  while (stack.length > 0) {
+    const { item, depth } = stack.pop();
+    if (item === undefined || typeof item === 'bigint' || typeof item === 'function' || typeof item === 'symbol') {
+      state.invalidJsonValue = true;
+      continue;
+    }
+    if (typeof item === 'number' && !Number.isFinite(item)) {
+      state.invalidJsonValue = true;
+      continue;
+    }
+    if (item === null || typeof item !== 'object') continue;
+    if (!Array.isArray(item) && !isPlainObject(item)) {
+      state.invalidJsonValue = true;
+      continue;
+    }
+    if (seen.has(item)) {
       state.cyclic = true;
+      continue;
+    }
+    seen.add(item);
+    state.maxDepth = Math.max(state.maxDepth, depth);
+    const keys = Object.keys(item);
+    state.keys += keys.length;
+    for (const key of keys) stack.push({ item: item[key], depth: depth + 1 });
+  }
+  return state;
+}
+
+function scanJsonStringToken(text, start) {
+  let position = start + 1;
+  while (position < text.length) {
+    const character = text[position];
+    if (character === '"') {
+      const raw = text.slice(start, position + 1);
+      try {
+        return { end: position + 1, value: JSON.parse(raw) };
+      } catch {
+        return null;
+      }
+    }
+    if (character === '\\') {
+      const escape = text[position + 1];
+      if (escape === 'u') {
+        if (!/^[0-9A-Fa-f]{4}$/u.test(text.slice(position + 2, position + 6))) return null;
+        position += 6;
+      } else if ('"\\/bfnrt'.includes(escape)) {
+        position += 2;
+      } else {
+        return null;
+      }
+      continue;
+    }
+    if (character < ' ') return null;
+    position += 1;
+  }
+  return null;
+}
+
+const JSON_NUMBER_PATTERN = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/u;
+
+function scanJsonHazards(text, maxJsonIntDigits) {
+  const hazards = { duplicateKey: false, nonFiniteNumber: false, oversizedInteger: false };
+  const stack = [];
+  let complete = false;
+  let position = 0;
+  const markValueComplete = () => {
+    if (stack.length === 0) {
+      complete = true;
       return;
     }
-    active.add(item);
-    state.maxDepth = Math.max(state.maxDepth, depth);
-    const keys = Array.isArray(item) ? item.map((_, index) => String(index)) : Object.keys(item);
-    state.keys += keys.length;
-    for (const key of keys) visit(item[key], depth + 1);
-    active.delete(item);
+    stack[stack.length - 1].state = 'commaOrEnd';
   };
-  visit(value, 0);
-  return state;
+  const closeContainer = () => {
+    stack.pop();
+    markValueComplete();
+  };
+  const parseValue = () => {
+    const character = text[position];
+    if (character === '{') {
+      stack.push({ type: 'object', state: 'keyOrEnd', keys: new Set() });
+      position += 1;
+      return true;
+    }
+    if (character === '[') {
+      stack.push({ type: 'array', state: 'valueOrEnd' });
+      position += 1;
+      return true;
+    }
+    if (character === '"') {
+      const token = scanJsonStringToken(text, position);
+      if (token === null) return false;
+      position = token.end;
+      markValueComplete();
+      return true;
+    }
+    if (character === '-' || /[0-9]/u.test(character)) {
+      const match = JSON_NUMBER_PATTERN.exec(text.slice(position));
+      if (match === null || match[0].length === 0) return false;
+      const token = match[0];
+      const numericValue = Number(token);
+      if (!Number.isFinite(numericValue)) hazards.nonFiniteNumber = true;
+      if (!/[.eE]/u.test(token)) {
+        const integerDigits = token.replace(/^-/u, '').replace(/^0+(?=[0-9])/u, '');
+        if (integerDigits.length > maxJsonIntDigits) hazards.oversizedInteger = true;
+      }
+      position += token.length;
+      markValueComplete();
+      return true;
+    }
+    for (const literal of ['true', 'false', 'null']) {
+      if (text.startsWith(literal, position)) {
+        position += literal.length;
+        markValueComplete();
+        return true;
+      }
+    }
+    return false;
+  };
+
+  while (position < text.length && !complete) {
+    while (position < text.length && /[\t\n\r ]/u.test(text[position])) position += 1;
+    if (position >= text.length) break;
+    if (stack.length === 0) {
+      if (!parseValue()) return hazards;
+      continue;
+    }
+    const frame = stack[stack.length - 1];
+    const character = text[position];
+    if (frame.type === 'object') {
+      if ((frame.state === 'keyOrEnd' || frame.state === 'key') && character === '}' && frame.state === 'keyOrEnd') {
+        position += 1;
+        closeContainer();
+        continue;
+      }
+      if (frame.state === 'keyOrEnd' || frame.state === 'key') {
+        if (character !== '"') return hazards;
+        const token = scanJsonStringToken(text, position);
+        if (token === null) return hazards;
+        if (frame.keys.has(token.value)) hazards.duplicateKey = true;
+        frame.keys.add(token.value);
+        frame.state = 'colon';
+        position = token.end;
+        continue;
+      }
+      if (frame.state === 'colon') {
+        if (character !== ':') return hazards;
+        frame.state = 'value';
+        position += 1;
+        continue;
+      }
+      if (frame.state === 'value') {
+        if (!parseValue()) return hazards;
+        continue;
+      }
+      if (frame.state === 'commaOrEnd') {
+        if (character === '}') {
+          position += 1;
+          closeContainer();
+          continue;
+        }
+        if (character !== ',') return hazards;
+        frame.state = 'key';
+        position += 1;
+        continue;
+      }
+    } else {
+      if (frame.state === 'valueOrEnd' && character === ']') {
+        position += 1;
+        closeContainer();
+        continue;
+      }
+      if (frame.state === 'valueOrEnd' || frame.state === 'value') {
+        if (!parseValue()) return hazards;
+        continue;
+      }
+      if (frame.state === 'commaOrEnd') {
+        if (character === ']') {
+          position += 1;
+          closeContainer();
+          continue;
+        }
+        if (character !== ',') return hazards;
+        frame.state = 'value';
+        position += 1;
+        continue;
+      }
+    }
+  }
+  return hazards;
 }
 
 function parseDiscoveryInput(input, policy, findings) {
@@ -1555,9 +1831,16 @@ function parseDiscoveryInput(input, policy, findings) {
       findings.push(makeFinding(CODE.DISCOVERY_INVALID_JSON, 'discovery JSON must not be empty', 'discovery'));
       return null;
     }
-    if (input.length > policy.maxDiscoveryBytes) {
+    if (Buffer.byteLength(input, 'utf8') > policy.maxDiscoveryBytes) {
       findings.push(makeFinding(CODE.RESOURCE_LIMIT, 'discovery JSON exceeds the byte limit', 'discovery'));
       return null;
+    }
+    const hazards = scanJsonHazards(input, policy.maxJsonIntDigits);
+    if (hazards.duplicateKey) {
+      findings.push(makeFinding(CODE.DISCOVERY_DUPLICATE_KEY, 'discovery JSON contains a duplicate object key', 'discovery', OAUTHCAGE_SEVERITY.CRITICAL));
+    }
+    if (hazards.nonFiniteNumber || hazards.oversizedInteger) {
+      findings.push(makeFinding(CODE.RESOURCE_LIMIT, 'discovery JSON contains a numeric value outside safe resource bounds', 'discovery'));
     }
     try {
       return JSON.parse(input);
@@ -1590,19 +1873,37 @@ function auditAlgorithmMetadata(document, policy, findings) {
   }
 }
 
+const RESPONSE_TYPE_METADATA_PATTERN = /^[\x21-\x7E]+(?: [\x21-\x7E]+)*$/u;
+const GRANT_TYPE_METADATA_PATTERN = /^[\x21-\x7E]{1,256}$/u;
+
 function auditFlowMetadata(document, findings) {
   const responseTypes = document.response_types_supported;
-  if (Array.isArray(responseTypes)) {
+  if (!Array.isArray(responseTypes) || responseTypes.length === 0) {
+    findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'discovery document must publish response_types_supported as a non-empty array', 'response_types_supported'));
+  } else {
     for (const responseType of responseTypes) {
-      if (typeof responseType === 'string' && /(?:^| )(?:token|id_token)(?: |$)/u.test(responseType)) {
-        findings.push(makeFinding(CODE.DISCOVERY_INSECURE_FLOW, 'discovery document advertises implicit or hybrid token flows', 'response_types_supported', OAUTHCAGE_SEVERITY.CRITICAL));
+      if (typeof responseType !== 'string' || !RESPONSE_TYPE_METADATA_PATTERN.test(responseType) || responseType.length > 128) {
+        findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'response type metadata must contain only canonical visible ASCII values', 'response_types_supported'));
         break;
       }
     }
+    if (responseTypes.some((responseType) => typeof responseType === 'string' && /(?:^| )(?:token|id_token)(?: |$)/u.test(responseType))) {
+      findings.push(makeFinding(CODE.DISCOVERY_INSECURE_FLOW, 'discovery document advertises implicit or hybrid token flows', 'response_types_supported', OAUTHCAGE_SEVERITY.CRITICAL));
+    }
   }
   const grants = document.grant_types_supported;
-  if (Array.isArray(grants) && grants.includes('password')) {
-    findings.push(makeFinding(CODE.DISCOVERY_INSECURE_FLOW, 'discovery document advertises the resource owner password credentials grant', 'grant_types_supported', OAUTHCAGE_SEVERITY.CRITICAL));
+  if (!Array.isArray(grants) || grants.length === 0) {
+    findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'discovery document must publish grant_types_supported as a non-empty array for fail-closed flow validation', 'grant_types_supported'));
+  } else {
+    for (const grant of grants) {
+      if (typeof grant !== 'string' || !GRANT_TYPE_METADATA_PATTERN.test(grant)) {
+        findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'grant type metadata must contain only visible ASCII values without whitespace', 'grant_types_supported'));
+        break;
+      }
+    }
+    if (grants.includes('password')) {
+      findings.push(makeFinding(CODE.DISCOVERY_INSECURE_FLOW, 'discovery document advertises the resource owner password credentials grant', 'grant_types_supported', OAUTHCAGE_SEVERITY.CRITICAL));
+    }
   }
 }
 
@@ -1613,6 +1914,9 @@ function auditPkceMetadata(document, policy, findings) {
       findings.push(makeFinding(CODE.DISCOVERY_PKCE_MISSING, 'discovery document does not advertise PKCE methods', 'code_challenge_methods_supported'));
     }
     return;
+  }
+  if (methods.some((method) => typeof method !== 'string' || !/^[\x21-\x7E]{1,64}$/u.test(method))) {
+    findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'PKCE method metadata must contain only visible ASCII strings', 'code_challenge_methods_supported'));
   }
   if (!methods.includes('S256')) {
     findings.push(makeFinding(CODE.DISCOVERY_PKCE_MISSING, 'discovery document does not advertise S256 PKCE', 'code_challenge_methods_supported', OAUTHCAGE_SEVERITY.CRITICAL));
@@ -1637,10 +1941,12 @@ function auditDiscoveryMetadata(input, options = {}) {
       findings.push(makeFinding(CODE.PROTOTYPE_POLLUTION, 'discovery document contains a prototype pollution key', 'discovery', OAUTHCAGE_SEVERITY.CRITICAL));
       usable = false;
     }
-    const stats = documentStats(document);
-    if (stats.cyclic || stats.maxDepth > policy.maxDiscoveryDepth || stats.keys > policy.maxDiscoveryKeys) {
-      findings.push(makeFinding(CODE.RESOURCE_LIMIT, 'discovery document exceeds depth, key count, or structure limits', 'discovery'));
-      usable = false;
+    if (prototypeKey === null) {
+      const stats = documentStats(document);
+      if (stats.cyclic || stats.invalidJsonValue || stats.maxDepth > policy.maxDiscoveryDepth || stats.keys > policy.maxDiscoveryKeys) {
+        findings.push(makeFinding(CODE.RESOURCE_LIMIT, 'discovery document exceeds depth, key count, or JSON structure limits', 'discovery'));
+        usable = false;
+      }
     }
   }
 
@@ -1688,7 +1994,7 @@ function auditDiscoveryMetadata(input, options = {}) {
     issuerMatches: issuerCanonical !== null && expectedCanonical !== null && issuerCanonical === expectedCanonical,
     requiredEndpointsPresent: usable ? REQUIRED_ENDPOINT_KEYS.every((key) => typeof document[key] === 'string') : false,
     endpointsAudited: usable ? ENDPOINT_KEYS.filter((key) => typeof document[key] === 'string').length : 0
-  });
+  }, policy.maxFindings);
 }
 const __exports = Object.create(null);
 __exports["auditEndpointUrl"] = auditEndpointUrl;
@@ -1842,7 +2148,7 @@ return __exports;
 
 const __oauthcageModule7 = (() => {
 const { CODE } = __oauthcageModule0;
-const { collectStringFindings, isPlainObject, makeFinding, percentDecode, scanPrototypeKeys } = __oauthcageModule2;
+const { collectStringFindings, firstUnsafeCharacter, isPlainObject, makeFinding, OBJECT_INJECTION_KEYS, percentDecode, scanPrototypeKeys } = __oauthcageModule2;
 /* Duplicate-preserving application/x-www-form-urlencoded parameter parsing. */
 
 function pushParameter(target, name, value) {
@@ -1901,8 +2207,12 @@ function parseParameterString(text, policy, field) {
       findings.push(makeFinding(CODE.PARAMETER_TOO_LONG, field + ' contains an oversized parameter component', field));
       continue;
     }
-    if (/[\u0000-\u001F\u007F-\u009F]/u.test(name)) {
-      findings.push(makeFinding(CODE.CONTROL_CHARACTER, field + ' contains a control character in a parameter name', field));
+    if (firstUnsafeCharacter(name) !== null || /\s/u.test(name)) {
+      findings.push(makeFinding(CODE.CONTROL_CHARACTER, field + ' contains whitespace, a control character, or a hidden character in a parameter name', field));
+      continue;
+    }
+    if (OBJECT_INJECTION_KEYS.includes(name)) {
+      findings.push(makeFinding(CODE.PROTOTYPE_POLLUTION, field + ' contains an object injection key', field, 'critical'));
       continue;
     }
     if (Object.prototype.hasOwnProperty.call(values, name)) {
@@ -1935,8 +2245,8 @@ function parseParameterObject(input, policy, field) {
       findings.push(makeFinding(CODE.INVALID_INPUT, field + ' contains an invalid parameter name', field));
       continue;
     }
-    if (/[\u0000-\u001F\u007F-\u009F\s]/u.test(name)) {
-      findings.push(makeFinding(CODE.CONTROL_CHARACTER, field + ' contains whitespace or a control character in a parameter name', field));
+    if (firstUnsafeCharacter(name) !== null || /\s/u.test(name)) {
+      findings.push(makeFinding(CODE.CONTROL_CHARACTER, field + ' contains whitespace, a control character, or a hidden character in a parameter name', field));
       continue;
     }
     const raw = input[name];
@@ -2304,14 +2614,14 @@ function auditAuthRequest(input, options = {}) {
   if (responseMode === 'fragment') {
     findings.push(makeFinding(CODE.RESPONSE_MODE_DENIED, 'fragment response mode is denied', 'response_mode', OAUTHCAGE_SEVERITY.CRITICAL));
   }
-  scanSensitiveKeys(values, 'authorization request', findings, false);
+  scanSensitiveKeys(values, 'authorization request', findings, true);
 
   return finishAudit('authorization-request', policy.name, findings, {
     flow: responseType === 'code' ? 'authorization_code' : null,
     usesPar: requestUri !== undefined,
     hasPkce: challenge !== undefined,
     hasState: state !== undefined
-  });
+  }, policy.maxFindings);
 }
 
 function auditCallback(input, options = {}) {
@@ -2389,7 +2699,7 @@ function auditCallback(input, options = {}) {
     hasCode: code !== undefined,
     hasIssuer: issuer !== undefined,
     hasState: state !== undefined
-  });
+  }, policy.maxFindings);
 }
 
 function auditTokenRequest(input, options = {}) {
@@ -2455,7 +2765,7 @@ function auditTokenRequest(input, options = {}) {
     grantType: grantType === undefined ? null : grantType,
     usesPkce: firstValue(values, 'code_verifier') !== undefined,
     usesClientSecret: hasParameter(values, 'client_secret')
-  });
+  }, policy.maxFindings);
 }
 const __exports = Object.create(null);
 __exports["auditAuthRequest"] = auditAuthRequest;

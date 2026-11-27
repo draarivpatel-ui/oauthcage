@@ -403,7 +403,7 @@ export function auditRedirectUri(candidate, registeredRedirectUris, options = {}
     matched,
     matchedUri: safeCandidate && matched ? analyzedCandidate.canonical : null,
     meta: analyzedCandidate.meta
-  });
+  }, policy.maxFindings);
 }
 
 export function validateRedirectUri(candidate, registeredRedirectUris, options = {}) {

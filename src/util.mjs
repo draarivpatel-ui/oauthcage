@@ -16,6 +16,13 @@ export const SENSITIVE_PARAMETER_NAMES = Object.freeze([
   'assertion',
   'token'
 ]);
+export const OBJECT_INJECTION_KEYS = Object.freeze([
+  '__proto__',
+  'constructor',
+  'prototype',
+  'toString',
+  'valueOf'
+]);
 
 export function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -38,12 +45,24 @@ export function hasErrorFinding(findings) {
   return findings.some((finding) => finding.severity === OAUTHCAGE_SEVERITY.ERROR || finding.severity === OAUTHCAGE_SEVERITY.CRITICAL);
 }
 
-export function finishAudit(kind, policyName, findings, extra) {
+export function finishAudit(kind, policyName, findings, extra, maxFindings = 150) {
+  const totalFindings = findings.length;
+  const truncated = totalFindings > maxFindings;
+  const bounded = findings.slice(0, maxFindings);
+  if (truncated && maxFindings > 0) {
+    bounded[maxFindings - 1] = makeFinding(
+      CODE.FINDINGS_TRUNCATED,
+      'finding output was capped and the audit is failed closed',
+      'findings'
+    );
+  }
   return deepFreeze({
     kind,
     policy: policyName,
-    ok: !hasErrorFinding(findings),
-    findings: findings.slice(),
+    ok: !hasErrorFinding(findings) && !truncated,
+    findings: bounded,
+    truncated,
+    totalFindings,
     ...(extra || {})
   });
 }
@@ -212,17 +231,32 @@ export function predictableToken(value) {
   return repeatedChunkPattern(value);
 }
 
-export function scanPrototypeKeys(value, depth = 0, state = { count: 0, maxDepth: 0, seen: new Set() }) {
+export function scanPrototypeKeys(value) {
   if (value === null || typeof value !== 'object') return null;
-  if (state.seen.has(value)) return null;
-  state.seen.add(value);
-  state.count += 1;
-  state.maxDepth = Math.max(state.maxDepth, depth);
-  const keys = Array.isArray(value) ? value.map((_, index) => String(index)) : Object.keys(value);
-  for (const key of keys) {
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return key;
-    const nested = scanPrototypeKeys(value[key], depth + 1, state);
-    if (nested !== null) return nested;
+  const seen = new Set();
+  const stack = [value];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current === null || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    let keys;
+    try {
+      keys = Object.keys(current);
+    } catch {
+      return '__object_keys_unavailable__';
+    }
+    for (const key of keys) {
+      if (OBJECT_INJECTION_KEYS.includes(key)) return key;
+      let descriptor;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(current, key);
+      } catch {
+        return key;
+      }
+      if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return key;
+      const nested = descriptor.value;
+      if (nested !== null && typeof nested === 'object' && !seen.has(nested)) stack.push(nested);
+    }
   }
   return null;
 }
@@ -256,9 +290,65 @@ export function neutralizeTerminal(text) {
   return output;
 }
 
+function decodedSensitiveParameterName(rawName) {
+  if (rawName.length === 0 || rawName.length > 128) return null;
+  let decoded;
+  try {
+    decoded = percentDecode(rawName, { plusAsSpace: true }).toLowerCase();
+  } catch {
+    return null;
+  }
+  return SENSITIVE_PARAMETER_NAMES.includes(decoded) || decoded === 'code' ? decoded : null;
+}
+
 export function redactSensitiveText(text) {
-  let output = String(text);
-  output = output.replace(/([?&#]?(?:access_token|id_token|refresh_token|client_secret|code_verifier|password|assertion|token|code)=)[^&\s#]*/giu, '$1[REDACTED]');
+  const input = String(text);
+  let output = '';
+  let copied = 0;
+  let index = 0;
+  while (index < input.length) {
+    const separator = input[index];
+    if (separator !== '=' && separator !== ':') {
+      index += 1;
+      continue;
+    }
+    let keyEnd = index;
+    while (keyEnd > 0 && input[keyEnd - 1] === ' ') keyEnd -= 1;
+    if (keyEnd > 0 && (input[keyEnd - 1] === '"' || input[keyEnd - 1] === "'")) keyEnd -= 1;
+    let keyStart = keyEnd;
+    while (keyStart > 0 && !/[\s&?#;,"'=:]/u.test(input[keyStart - 1])) keyStart -= 1;
+    const rawName = input.slice(keyStart, keyEnd);
+    if (decodedSensitiveParameterName(rawName) === null) {
+      index += 1;
+      continue;
+    }
+    let valueStart = index + 1;
+    while (valueStart < input.length && input[valueStart] === ' ') valueStart += 1;
+    let valueEnd = valueStart;
+    let quoted = false;
+    if (input[valueStart] === '"' || input[valueStart] === "'") {
+      quoted = true;
+      const quote = input[valueStart];
+      valueEnd = valueStart + 1;
+      while (valueEnd < input.length) {
+        if (input[valueEnd] === '\\') {
+          valueEnd += 2;
+          continue;
+        }
+        if (input[valueEnd] === quote) break;
+        valueEnd += 1;
+      }
+      if (valueEnd < input.length) valueEnd += 1;
+    } else {
+      while (valueEnd < input.length && !/[\s&,#;]/u.test(input[valueEnd])) valueEnd += 1;
+    }
+    output += input.slice(copied, keyStart);
+    output += input.slice(keyStart, valueStart);
+    output += quoted ? input[valueStart] + '[REDACTED]' + input[valueEnd - 1] : '[REDACTED]';
+    copied = valueEnd;
+    index = valueEnd;
+  }
+  output += input.slice(copied);
   return neutralizeTerminal(output);
 }
 

@@ -160,14 +160,14 @@ const discovery = auditDiscoveryMetadata(metadataJsonOrObject, {
 });
 ```
 
-The discovery firewall validates required endpoints, exact issuer equality, signing algorithm metadata, flow metadata, PKCE support, object shape, depth, key count, and prototype-pollution keys.
+The discovery firewall validates required endpoints, exact issuer equality, signing algorithm metadata, flow metadata, PKCE support, object shape, duplicate JSON object keys, numeric resource bounds, UTF-8 byte length, depth, key count, and object-injection keys. Malformed flow metadata and noncanonical whitespace in response or grant type values fail closed. Audit reports cap findings with `maxFindings`; truncation is itself a failure so `maxFindings: 0` cannot hide findings.
 
 Endpoint validation requires HTTPS and rejects:
 
 - userinfo, fragments, unapproved query strings, and unapproved ports
 - loopback, private, link-local, multicast, reserved, documentation, benchmark, CGNAT, and unspecified IP ranges
 - cloud metadata targets including `169.254.169.254`, `169.254.170.23`, and `fd00:ec2::23`
-- IPv4-mapped, IPv4-compatible, IPv4-translated, NAT64, NAT64-local, 6to4, and Teredo transition encodings
+- IPv4-mapped, IPv4-compatible, IPv4-translated, NAT64, NAT64-local, 6to4, Teredo, and ISATAP transition encodings
 - decimal integer, octal, hexadecimal, shorthand, overflowing, or otherwise ambiguous IPv4 forms
 - `localhost`, single-label names, `.local`, and `.internal`
 

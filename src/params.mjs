@@ -1,7 +1,7 @@
 /* Duplicate-preserving application/x-www-form-urlencoded parameter parsing. */
 
 import { CODE } from './errors.mjs';
-import { collectStringFindings, isPlainObject, makeFinding, percentDecode, scanPrototypeKeys } from './util.mjs';
+import { collectStringFindings, firstUnsafeCharacter, isPlainObject, makeFinding, OBJECT_INJECTION_KEYS, percentDecode, scanPrototypeKeys } from './util.mjs';
 
 function pushParameter(target, name, value) {
   if (!Object.prototype.hasOwnProperty.call(target, name)) target[name] = [];
@@ -59,8 +59,12 @@ export function parseParameterString(text, policy, field) {
       findings.push(makeFinding(CODE.PARAMETER_TOO_LONG, field + ' contains an oversized parameter component', field));
       continue;
     }
-    if (/[\u0000-\u001F\u007F-\u009F]/u.test(name)) {
-      findings.push(makeFinding(CODE.CONTROL_CHARACTER, field + ' contains a control character in a parameter name', field));
+    if (firstUnsafeCharacter(name) !== null || /\s/u.test(name)) {
+      findings.push(makeFinding(CODE.CONTROL_CHARACTER, field + ' contains whitespace, a control character, or a hidden character in a parameter name', field));
+      continue;
+    }
+    if (OBJECT_INJECTION_KEYS.includes(name)) {
+      findings.push(makeFinding(CODE.PROTOTYPE_POLLUTION, field + ' contains an object injection key', field, 'critical'));
       continue;
     }
     if (Object.prototype.hasOwnProperty.call(values, name)) {
@@ -93,8 +97,8 @@ export function parseParameterObject(input, policy, field) {
       findings.push(makeFinding(CODE.INVALID_INPUT, field + ' contains an invalid parameter name', field));
       continue;
     }
-    if (/[\u0000-\u001F\u007F-\u009F\s]/u.test(name)) {
-      findings.push(makeFinding(CODE.CONTROL_CHARACTER, field + ' contains whitespace or a control character in a parameter name', field));
+    if (firstUnsafeCharacter(name) !== null || /\s/u.test(name)) {
+      findings.push(makeFinding(CODE.CONTROL_CHARACTER, field + ' contains whitespace, a control character, or a hidden character in a parameter name', field));
       continue;
     }
     const raw = input[name];

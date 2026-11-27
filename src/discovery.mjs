@@ -201,27 +201,202 @@ export function auditEndpointUrl(endpoint, options = {}) {
     ipScope: hostResult.ipScope,
     tunnel: hostResult.tunnel,
     port: parts && parts.port !== null ? String(Number(parts.port)) : '443'
-  });
+  }, policy.maxFindings);
 }
 
 function documentStats(value) {
-  const state = { keys: 0, maxDepth: 0, cyclic: false };
-  const active = new Set();
-  const visit = (item, depth) => {
-    if (item === null || typeof item !== 'object') return;
-    if (active.has(item)) {
+  const state = { keys: 0, maxDepth: 0, cyclic: false, invalidJsonValue: false };
+  const seen = new Set();
+  const stack = [{ item: value, depth: 0 }];
+  while (stack.length > 0) {
+    const { item, depth } = stack.pop();
+    if (item === undefined || typeof item === 'bigint' || typeof item === 'function' || typeof item === 'symbol') {
+      state.invalidJsonValue = true;
+      continue;
+    }
+    if (typeof item === 'number' && !Number.isFinite(item)) {
+      state.invalidJsonValue = true;
+      continue;
+    }
+    if (item === null || typeof item !== 'object') continue;
+    if (!Array.isArray(item) && !isPlainObject(item)) {
+      state.invalidJsonValue = true;
+      continue;
+    }
+    if (seen.has(item)) {
       state.cyclic = true;
+      continue;
+    }
+    seen.add(item);
+    state.maxDepth = Math.max(state.maxDepth, depth);
+    const keys = Object.keys(item);
+    state.keys += keys.length;
+    for (const key of keys) stack.push({ item: item[key], depth: depth + 1 });
+  }
+  return state;
+}
+
+function scanJsonStringToken(text, start) {
+  let position = start + 1;
+  while (position < text.length) {
+    const character = text[position];
+    if (character === '"') {
+      const raw = text.slice(start, position + 1);
+      try {
+        return { end: position + 1, value: JSON.parse(raw) };
+      } catch {
+        return null;
+      }
+    }
+    if (character === '\\') {
+      const escape = text[position + 1];
+      if (escape === 'u') {
+        if (!/^[0-9A-Fa-f]{4}$/u.test(text.slice(position + 2, position + 6))) return null;
+        position += 6;
+      } else if ('"\\/bfnrt'.includes(escape)) {
+        position += 2;
+      } else {
+        return null;
+      }
+      continue;
+    }
+    if (character < ' ') return null;
+    position += 1;
+  }
+  return null;
+}
+
+const JSON_NUMBER_PATTERN = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/u;
+
+function scanJsonHazards(text, maxJsonIntDigits) {
+  const hazards = { duplicateKey: false, nonFiniteNumber: false, oversizedInteger: false };
+  const stack = [];
+  let complete = false;
+  let position = 0;
+  const markValueComplete = () => {
+    if (stack.length === 0) {
+      complete = true;
       return;
     }
-    active.add(item);
-    state.maxDepth = Math.max(state.maxDepth, depth);
-    const keys = Array.isArray(item) ? item.map((_, index) => String(index)) : Object.keys(item);
-    state.keys += keys.length;
-    for (const key of keys) visit(item[key], depth + 1);
-    active.delete(item);
+    stack[stack.length - 1].state = 'commaOrEnd';
   };
-  visit(value, 0);
-  return state;
+  const closeContainer = () => {
+    stack.pop();
+    markValueComplete();
+  };
+  const parseValue = () => {
+    const character = text[position];
+    if (character === '{') {
+      stack.push({ type: 'object', state: 'keyOrEnd', keys: new Set() });
+      position += 1;
+      return true;
+    }
+    if (character === '[') {
+      stack.push({ type: 'array', state: 'valueOrEnd' });
+      position += 1;
+      return true;
+    }
+    if (character === '"') {
+      const token = scanJsonStringToken(text, position);
+      if (token === null) return false;
+      position = token.end;
+      markValueComplete();
+      return true;
+    }
+    if (character === '-' || /[0-9]/u.test(character)) {
+      const match = JSON_NUMBER_PATTERN.exec(text.slice(position));
+      if (match === null || match[0].length === 0) return false;
+      const token = match[0];
+      const numericValue = Number(token);
+      if (!Number.isFinite(numericValue)) hazards.nonFiniteNumber = true;
+      if (!/[.eE]/u.test(token)) {
+        const integerDigits = token.replace(/^-/u, '').replace(/^0+(?=[0-9])/u, '');
+        if (integerDigits.length > maxJsonIntDigits) hazards.oversizedInteger = true;
+      }
+      position += token.length;
+      markValueComplete();
+      return true;
+    }
+    for (const literal of ['true', 'false', 'null']) {
+      if (text.startsWith(literal, position)) {
+        position += literal.length;
+        markValueComplete();
+        return true;
+      }
+    }
+    return false;
+  };
+
+  while (position < text.length && !complete) {
+    while (position < text.length && /[\t\n\r ]/u.test(text[position])) position += 1;
+    if (position >= text.length) break;
+    if (stack.length === 0) {
+      if (!parseValue()) return hazards;
+      continue;
+    }
+    const frame = stack[stack.length - 1];
+    const character = text[position];
+    if (frame.type === 'object') {
+      if ((frame.state === 'keyOrEnd' || frame.state === 'key') && character === '}' && frame.state === 'keyOrEnd') {
+        position += 1;
+        closeContainer();
+        continue;
+      }
+      if (frame.state === 'keyOrEnd' || frame.state === 'key') {
+        if (character !== '"') return hazards;
+        const token = scanJsonStringToken(text, position);
+        if (token === null) return hazards;
+        if (frame.keys.has(token.value)) hazards.duplicateKey = true;
+        frame.keys.add(token.value);
+        frame.state = 'colon';
+        position = token.end;
+        continue;
+      }
+      if (frame.state === 'colon') {
+        if (character !== ':') return hazards;
+        frame.state = 'value';
+        position += 1;
+        continue;
+      }
+      if (frame.state === 'value') {
+        if (!parseValue()) return hazards;
+        continue;
+      }
+      if (frame.state === 'commaOrEnd') {
+        if (character === '}') {
+          position += 1;
+          closeContainer();
+          continue;
+        }
+        if (character !== ',') return hazards;
+        frame.state = 'key';
+        position += 1;
+        continue;
+      }
+    } else {
+      if (frame.state === 'valueOrEnd' && character === ']') {
+        position += 1;
+        closeContainer();
+        continue;
+      }
+      if (frame.state === 'valueOrEnd' || frame.state === 'value') {
+        if (!parseValue()) return hazards;
+        continue;
+      }
+      if (frame.state === 'commaOrEnd') {
+        if (character === ']') {
+          position += 1;
+          closeContainer();
+          continue;
+        }
+        if (character !== ',') return hazards;
+        frame.state = 'value';
+        position += 1;
+        continue;
+      }
+    }
+  }
+  return hazards;
 }
 
 function parseDiscoveryInput(input, policy, findings) {
@@ -230,9 +405,16 @@ function parseDiscoveryInput(input, policy, findings) {
       findings.push(makeFinding(CODE.DISCOVERY_INVALID_JSON, 'discovery JSON must not be empty', 'discovery'));
       return null;
     }
-    if (input.length > policy.maxDiscoveryBytes) {
+    if (Buffer.byteLength(input, 'utf8') > policy.maxDiscoveryBytes) {
       findings.push(makeFinding(CODE.RESOURCE_LIMIT, 'discovery JSON exceeds the byte limit', 'discovery'));
       return null;
+    }
+    const hazards = scanJsonHazards(input, policy.maxJsonIntDigits);
+    if (hazards.duplicateKey) {
+      findings.push(makeFinding(CODE.DISCOVERY_DUPLICATE_KEY, 'discovery JSON contains a duplicate object key', 'discovery', OAUTHCAGE_SEVERITY.CRITICAL));
+    }
+    if (hazards.nonFiniteNumber || hazards.oversizedInteger) {
+      findings.push(makeFinding(CODE.RESOURCE_LIMIT, 'discovery JSON contains a numeric value outside safe resource bounds', 'discovery'));
     }
     try {
       return JSON.parse(input);
@@ -265,19 +447,37 @@ function auditAlgorithmMetadata(document, policy, findings) {
   }
 }
 
+const RESPONSE_TYPE_METADATA_PATTERN = /^[\x21-\x7E]+(?: [\x21-\x7E]+)*$/u;
+const GRANT_TYPE_METADATA_PATTERN = /^[\x21-\x7E]{1,256}$/u;
+
 function auditFlowMetadata(document, findings) {
   const responseTypes = document.response_types_supported;
-  if (Array.isArray(responseTypes)) {
+  if (!Array.isArray(responseTypes) || responseTypes.length === 0) {
+    findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'discovery document must publish response_types_supported as a non-empty array', 'response_types_supported'));
+  } else {
     for (const responseType of responseTypes) {
-      if (typeof responseType === 'string' && /(?:^| )(?:token|id_token)(?: |$)/u.test(responseType)) {
-        findings.push(makeFinding(CODE.DISCOVERY_INSECURE_FLOW, 'discovery document advertises implicit or hybrid token flows', 'response_types_supported', OAUTHCAGE_SEVERITY.CRITICAL));
+      if (typeof responseType !== 'string' || !RESPONSE_TYPE_METADATA_PATTERN.test(responseType) || responseType.length > 128) {
+        findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'response type metadata must contain only canonical visible ASCII values', 'response_types_supported'));
         break;
       }
     }
+    if (responseTypes.some((responseType) => typeof responseType === 'string' && /(?:^| )(?:token|id_token)(?: |$)/u.test(responseType))) {
+      findings.push(makeFinding(CODE.DISCOVERY_INSECURE_FLOW, 'discovery document advertises implicit or hybrid token flows', 'response_types_supported', OAUTHCAGE_SEVERITY.CRITICAL));
+    }
   }
   const grants = document.grant_types_supported;
-  if (Array.isArray(grants) && grants.includes('password')) {
-    findings.push(makeFinding(CODE.DISCOVERY_INSECURE_FLOW, 'discovery document advertises the resource owner password credentials grant', 'grant_types_supported', OAUTHCAGE_SEVERITY.CRITICAL));
+  if (!Array.isArray(grants) || grants.length === 0) {
+    findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'discovery document must publish grant_types_supported as a non-empty array for fail-closed flow validation', 'grant_types_supported'));
+  } else {
+    for (const grant of grants) {
+      if (typeof grant !== 'string' || !GRANT_TYPE_METADATA_PATTERN.test(grant)) {
+        findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'grant type metadata must contain only visible ASCII values without whitespace', 'grant_types_supported'));
+        break;
+      }
+    }
+    if (grants.includes('password')) {
+      findings.push(makeFinding(CODE.DISCOVERY_INSECURE_FLOW, 'discovery document advertises the resource owner password credentials grant', 'grant_types_supported', OAUTHCAGE_SEVERITY.CRITICAL));
+    }
   }
 }
 
@@ -288,6 +488,9 @@ function auditPkceMetadata(document, policy, findings) {
       findings.push(makeFinding(CODE.DISCOVERY_PKCE_MISSING, 'discovery document does not advertise PKCE methods', 'code_challenge_methods_supported'));
     }
     return;
+  }
+  if (methods.some((method) => typeof method !== 'string' || !/^[\x21-\x7E]{1,64}$/u.test(method))) {
+    findings.push(makeFinding(CODE.DISCOVERY_INVALID_DOCUMENT, 'PKCE method metadata must contain only visible ASCII strings', 'code_challenge_methods_supported'));
   }
   if (!methods.includes('S256')) {
     findings.push(makeFinding(CODE.DISCOVERY_PKCE_MISSING, 'discovery document does not advertise S256 PKCE', 'code_challenge_methods_supported', OAUTHCAGE_SEVERITY.CRITICAL));
@@ -312,10 +515,12 @@ export function auditDiscoveryMetadata(input, options = {}) {
       findings.push(makeFinding(CODE.PROTOTYPE_POLLUTION, 'discovery document contains a prototype pollution key', 'discovery', OAUTHCAGE_SEVERITY.CRITICAL));
       usable = false;
     }
-    const stats = documentStats(document);
-    if (stats.cyclic || stats.maxDepth > policy.maxDiscoveryDepth || stats.keys > policy.maxDiscoveryKeys) {
-      findings.push(makeFinding(CODE.RESOURCE_LIMIT, 'discovery document exceeds depth, key count, or structure limits', 'discovery'));
-      usable = false;
+    if (prototypeKey === null) {
+      const stats = documentStats(document);
+      if (stats.cyclic || stats.invalidJsonValue || stats.maxDepth > policy.maxDiscoveryDepth || stats.keys > policy.maxDiscoveryKeys) {
+        findings.push(makeFinding(CODE.RESOURCE_LIMIT, 'discovery document exceeds depth, key count, or JSON structure limits', 'discovery'));
+        usable = false;
+      }
     }
   }
 
@@ -363,5 +568,5 @@ export function auditDiscoveryMetadata(input, options = {}) {
     issuerMatches: issuerCanonical !== null && expectedCanonical !== null && issuerCanonical === expectedCanonical,
     requiredEndpointsPresent: usable ? REQUIRED_ENDPOINT_KEYS.every((key) => typeof document[key] === 'string') : false,
     endpointsAudited: usable ? ENDPOINT_KEYS.filter((key) => typeof document[key] === 'string').length : 0
-  });
+  }, policy.maxFindings);
 }

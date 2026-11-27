@@ -373,3 +373,69 @@ test('discovery result is deeply frozen', () => {
     result.issuerMatches = false;
   }, TypeError);
 });
+
+for (const address of ['2001:4860::5efe:a9fe:a9fe', '2001:4860::200:5efe:c000:201']) {
+  test('endpoint blocks ISATAP transition encoding ' + address, () => {
+    const result = expectEndpointFail('https://[' + address + ']/token', 'OAUTHCAGE_ENDPOINT_TUNNEL_DENIED');
+    assert.equal(result.tunnel, 'isatap');
+  });
+}
+
+test('discovery rejects deeply nested objects without recursion failure', () => {
+  let nested = {};
+  const root = nested;
+  for (let index = 0; index < 12000; index += 1) {
+    nested.next = {};
+    nested = nested.next;
+  }
+  expectDiscoveryFail(validDiscovery({ nested: root }), 'OAUTHCAGE_RESOURCE_LIMIT');
+});
+
+for (const input of [
+  '{"issuer":"https://issuer.example","issuer":"https://issuer.example"}',
+  '{"outer":{"issuer":1,"issuer":2}}'
+]) {
+  test('discovery rejects duplicate JSON object keys', () => {
+    expectDiscoveryFail(input, 'OAUTHCAGE_DISCOVERY_DUPLICATE_KEY');
+  });
+}
+
+test('discovery rejects numeric exponent overflow in JSON text', () => {
+  expectDiscoveryFail('{"x":1e9999}', 'OAUTHCAGE_RESOURCE_LIMIT');
+});
+
+test('discovery enforces maxDiscoveryBytes as UTF-8 bytes', () => {
+  const policy = createOAuthPolicy('strict', { maxDiscoveryBytes: 1024 });
+  const input = '{"x":"' + 'é'.repeat(600) + '"}';
+  assert.equal(Buffer.byteLength(input, 'utf8') > 1024, true);
+  assert.equal(input.length < 1024, true);
+  expectDiscoveryFail(input, 'OAUTHCAGE_RESOURCE_LIMIT', { policy, expectedIssuer: ISSUER });
+});
+
+for (const [label, mutate] of [
+  ['response type tab', (doc) => { doc.response_types_supported = ['code\ttoken']; }],
+  ['grant newline', (doc) => { doc.grant_types_supported = ['authorization_code\n']; }],
+  ['response type scalar', (doc) => { doc.response_types_supported = 'code'; }],
+  ['grant scalar', (doc) => { doc.grant_types_supported = 'authorization_code'; }]
+]) {
+  test('discovery rejects malformed flow metadata for ' + label, () => {
+    const doc = validDiscovery();
+    mutate(doc);
+    expectDiscoveryFail(doc, 'OAUTHCAGE_DISCOVERY_INVALID_DOCUMENT');
+  });
+}
+
+for (const key of ['toString', 'valueOf']) {
+  test('discovery rejects object injection key ' + key, () => {
+    expectDiscoveryFail(validDiscovery({ nested: JSON.parse('{"' + key + '":true}') }), 'OAUTHCAGE_PROTOTYPE_POLLUTION');
+  });
+}
+
+test('maxFindings zero fails closed when findings are truncated', () => {
+  const policy = createOAuthPolicy('strict', { maxFindings: 0 });
+  const result = auditDiscoveryMetadata(validDiscovery({ issuer: 'http://issuer.example' }), { expectedIssuer: ISSUER, policy });
+  assert.equal(result.ok, false);
+  assert.equal(result.truncated, true);
+  assert.equal(result.findings.length, 0);
+  assert.equal(result.totalFindings > 0, true);
+});

@@ -30,6 +30,8 @@ export interface OAuthPolicy {
   readonly maxDiscoveryBytes: number;
   readonly maxDiscoveryDepth: number;
   readonly maxDiscoveryKeys: number;
+  readonly maxJsonIntDigits: number;
+  readonly maxFindings: number;
   readonly requireS256InDiscovery: boolean;
   readonly requireAsymmetricIdTokenAlgorithms: boolean;
 }
@@ -62,6 +64,8 @@ export interface OAuthPolicyOverrides {
   readonly maxDiscoveryBytes?: number;
   readonly maxDiscoveryDepth?: number;
   readonly maxDiscoveryKeys?: number;
+  readonly maxJsonIntDigits?: number;
+  readonly maxFindings?: number;
   readonly requireS256InDiscovery?: boolean;
   readonly requireAsymmetricIdTokenAlgorithms?: boolean;
 }
@@ -78,6 +82,8 @@ export interface AuditBaseResult {
   readonly policy: OAuthPolicyName;
   readonly ok: boolean;
   readonly findings: readonly OAuthCageFinding[];
+  readonly truncated: boolean;
+  readonly totalFindings: number;
 }
 
 export interface RedirectMeta {
