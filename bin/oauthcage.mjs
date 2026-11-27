@@ -5,6 +5,7 @@ import {
   auditAuthRequest,
   auditCallback,
   auditDiscoveryMetadata,
+  auditEndpointUrl,
   auditRedirectUri,
   createPkcePair,
   getPolicy,
@@ -14,7 +15,7 @@ import {
 } from '../src/index.mjs';
 
 const STDIN_LIMIT = 1024 * 1024;
-const COMMANDS = new Set(['audit-redirect', 'audit-auth-url', 'audit-callback', 'audit-discovery', 'verify-pkce', 'gen-pkce', 'help', '--help', '-h', '--version']);
+const COMMANDS = new Set(['audit-redirect', 'audit-auth-url', 'audit-callback', 'audit-discovery', 'audit-endpoint', 'verify-pkce', 'gen-pkce', 'help', '--help', '-h', '--version']);
 
 class CliUsageError extends Error {
   constructor(message) {
@@ -42,6 +43,7 @@ function usage() {
     '  oauthcage audit-auth-url <url|-> --registered <uri> [--registered <uri>] [--policy strict] [--json]',
     '  oauthcage audit-callback <url|-> [--expected-state <state>] [--expected-issuer <issuer>] [--policy strict] [--json]',
     '  oauthcage audit-discovery <json|-> --expected-issuer <issuer> [--policy strict] [--json]',
+    '  oauthcage audit-endpoint <url|-> [--policy strict] [--json]',
     '',
     'Use - to read exactly bounded stdin. Input whitespace is never trimmed away.'
   ].join('\n');
@@ -223,6 +225,14 @@ async function main() {
     if (typeof options['expected-issuer'] !== 'string') throw new CliUsageError('audit-discovery requires --expected-issuer');
     const input = await inputValue(positional);
     const result = auditDiscoveryMetadata(input, { ...policyOptions(options), expectedIssuer: options['expected-issuer'] });
+    emitResult(command, result, options.json === true);
+    return result.ok ? 0 : 1;
+  }
+
+  if (command === 'audit-endpoint') {
+    rejectUnknown(options, ['json', 'policy']);
+    const input = await inputValue(positional);
+    const result = auditEndpointUrl(input, policyOptions(options));
     emitResult(command, result, options.json === true);
     return result.ok ? 0 : 1;
   }

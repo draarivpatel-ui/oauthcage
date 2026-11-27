@@ -203,9 +203,13 @@ oauthcage audit-redirect https://app.example/cb --registered https://app.example
 oauthcage audit-auth-url - --registered https://app.example/cb < auth-url.txt
 oauthcage audit-callback - --expected-state <state> --expected-issuer https://issuer.example < callback.txt
 oauthcage audit-discovery - --expected-issuer https://issuer.example < discovery.json
+oauthcage audit-endpoint https://issuer.example/jwks
 ```
 
 Use `--json` for machine-readable output and `--policy` to select `strict`, `spa`, `confidential`, or `native`. Passing `-` reads at most one mebibyte from standard input without trimming hostile whitespace.
+
+`audit-endpoint` applies the endpoint firewall described above to a single JWKS, token, authorization, userinfo, revocation, or PAR endpoint URL. It exits `0` when the URL passes, `1` when the policy rejects it, and `2` for usage errors. Findings name the failed check without echoing the rejected URL path or query.
+
 
 The CLI prints stable codes, fields, severities, and messages. It does not echo caller-supplied `code`, `code_verifier`, `client_secret`, `access_token`, or `refresh_token` values in audit findings or errors. Terminal output is neutralized for ANSI escapes, C0 and C1 controls, bidi controls, U+2028, and U+2029.
 
